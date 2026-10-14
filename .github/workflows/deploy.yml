@@ -1,0 +1,64 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      WORKER: artifact-agent
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build metadata
+        env:
+          AGENT_TOKEN: ${{ secrets.AGENT_TOKEN }}
+          MIGRATE: ${{ vars.MIGRATE }}
+        run: |
+          jq -n \
+            --arg agent "$AGENT_TOKEN" \
+            --arg worker "$WORKER" \
+            '{
+              main_module: "worker.js",
+              compatibility_date: "2025-01-01",
+              bindings: [
+                {type: "ai", name: "AI", project: "<catalog>"},
+                {type: "durable_object_namespace", name: "RUNS", class_name: "RunState"},
+                {type: "durable_object_namespace", name: "SWARM", class_name: "SwarmRun"},
+                {type: "durable_object_namespace", name: "CFG", class_name: "Config"},
+                {type: "durable_object_namespace", name: "ART", class_name: "ArtStore"},
+                {type: "service", name: "SELF", service: $worker},
+                {type: "secret_text", name: "AGENT_TOKEN", text: $agent}
+              ]
+            }' > metadata.json
+
+          # First deploy on a NEW worker only: create all four DO classes as
+          # SQLite-backed (required on the Workers Free plan).
+          if [ "$MIGRATE" = "true" ]; then
+            jq '. + {migrations: {new_tag: "v1", new_sqlite_classes: ["RunState", "SwarmRun", "Config", "ArtStore"]}}' \
+              metadata.json > m.json && mv m.json metadata.json
+          fi
+
+      - name: Upload modules
+        run: |
+          ARGS=(-F "metadata=@metadata.json;type=application/json")
+          for f in *.js; do
+            ARGS+=(-F "$f=@$f;type=application/javascript+module")
+          done
+          curl -fsS -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            "${ARGS[@]}"
+          rm metadata.json
+
+      - name: Set cron schedule
+        run: |
+          curl -fsS -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER/schedules" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "content-type: application/json" \
+            -d '[{"cron": "0 * * * *"}]'
