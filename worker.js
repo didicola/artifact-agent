@@ -102,6 +102,7 @@ async function handleRequest(request, env) {
         roster: await getRoster(env),
         health: (await cfgGet(env, "health")) ?? {},
         runs: (await cfgGet(env, RUNS_KEY)) ?? [],
+        lastProbe: (await cfgGet(env, "lastProbe")) ?? null,
       });
     }
 
@@ -113,6 +114,13 @@ async function handleRequest(request, env) {
         return json({ error: err.message }, 400);
       }
       return json({ ok: true });
+    }
+
+    if (p === "/probe" && request.method === "POST") {
+      if (!authed(request, env)) return new Response("Unauthorized", { status: 401 });
+      const health = await probeRoster(env);
+      await cfgPut(env, "lastProbe", { at: Date.now(), cron: false });
+      return json({ ok: true, health });
     }
 
     const runMatch = p.match(/^\/runs\/([\w-]+)$/);
@@ -216,7 +224,12 @@ export default {
   },
 
   // Cron trigger: refresh model and endpoint health (hourly — family delta D6).
+  // Leaves a lastProbe stamp in Config DO so missed crons are visible.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(probeRoster(env).catch(() => {}));
+    ctx.waitUntil(
+      probeRoster(env)
+        .then(() => cfgPut(env, "lastProbe", { at: Date.now(), cron: true }))
+        .catch((e) => cfgPut(env, "lastProbe", { at: Date.now(), cron: true, error: String(e?.message ?? e).slice(0, 200) }).catch(() => {}))
+    );
   },
 };
